@@ -6,100 +6,105 @@ import ResultCard from "@/components/ResultCard";
 
 type ScanState = "idle" | "qr-scan" | "ask-front" | "ocr-processing" | "done" | "error";
 
+const QR_ELEMENT_ID = "aadhaar-qr-reader";
+
 export default function Scanner() {
-  const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const tickRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const html5QrRef = useRef<any>(null);
 
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [statusMsg, setStatusMsg] = useState("");
   const [result, setResult] = useState<AadhaarData | null>(null);
 
-  const stopCamera = useCallback(() => {
-    if (tickRef.current) clearInterval(tickRef.current);
+  const stopQrScanner = useCallback(async () => {
+    try {
+      if (html5QrRef.current) {
+        await html5QrRef.current.stop();
+        html5QrRef.current = null;
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const stopFrontCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
 
-  useEffect(() => () => stopCamera(), [stopCamera]);
+  useEffect(() => {
+    return () => {
+      stopQrScanner();
+      stopFrontCamera();
+    };
+  }, [stopQrScanner, stopFrontCamera]);
 
-  const captureFrame = useCallback((): string | null => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < video.HAVE_ENOUGH_DATA) return null;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext("2d")!.drawImage(video, 0, 0);
-    return canvas.toDataURL("image/jpeg", 0.95);
-  }, []);
-
-  const startQRLoop = useCallback(async () => {
-    const { BrowserQRCodeReader } = await import("@zxing/browser");
-    const reader = new BrowserQRCodeReader();
-
-    tickRef.current = setInterval(async () => {
-      const canvas = canvasRef.current;
-      const video = videoRef.current;
-      if (!canvas || !video || video.readyState < video.HAVE_ENOUGH_DATA) return;
-
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d")!.drawImage(video, 0, 0);
-
-      try {
-        const qrResult = await reader.decodeFromCanvas(canvas);
-        if (qrResult) {
-          const parsed = parseQRText(qrResult.getText());
-          if (parsed) {
-            if (tickRef.current) clearInterval(tickRef.current);
-            stopCamera();
-            setResult(parsed);
-            setScanState("done");
-          }
-        }
-      } catch {
-        // No QR found in this frame — normal, keep trying
-      }
-    }, 400);
-  }, [stopCamera]);
-
-  const startCamera = useCallback(async () => {
+  // ── Stage 1: QR scan via html5-qrcode ──────────────────────────────────────
+  const startQRScan = useCallback(async () => {
     setScanState("qr-scan");
     setResult(null);
-    setStatusMsg("Scanning for QR code…");
+    setStatusMsg("Point at the QR code on the back of the card");
+
+    const { Html5Qrcode } = await import("html5-qrcode");
+    const scanner = new Html5Qrcode(QR_ELEMENT_ID);
+    html5QrRef.current = scanner;
+
+    try {
+      await scanner.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        (decodedText) => {
+          console.log("[QR] decoded:", decodedText);
+          const parsed = parseQRText(decodedText);
+          if (parsed) {
+            stopQrScanner();
+            setResult(parsed);
+            setScanState("done");
+          } else {
+            console.warn("[QR] parsed as null, raw:", decodedText);
+          }
+        },
+        () => { /* frame with no QR — ignore */ }
+      );
+    } catch (e) {
+      console.error("[QR] start error:", e);
+      setScanState("error");
+      setStatusMsg("Camera access denied or not available.");
+    }
+  }, [stopQrScanner]);
+
+  // ── Stage 2: Front-side OCR ─────────────────────────────────────────────────
+  const switchToFrontOCR = useCallback(async () => {
+    await stopQrScanner();
+    setScanState("ask-front");
+    setStatusMsg("Flip the card — show the front side clearly");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
       });
       streamRef.current = stream;
       const video = videoRef.current!;
       video.srcObject = stream;
       await video.play();
-      startQRLoop();
     } catch {
       setScanState("error");
-      setStatusMsg("Camera access denied. Please allow camera permission.");
+      setStatusMsg("Camera error. Please try again.");
     }
-  }, [startQRLoop]);
-
-  const qrFailed = useCallback(() => {
-    // Keep camera running, switch to front-side OCR mode
-    if (tickRef.current) clearInterval(tickRef.current);
-    setScanState("ask-front");
-    setStatusMsg("Flip the card — point camera at the front");
-  }, []);
+  }, [stopQrScanner]);
 
   const runOCR = useCallback(async () => {
-    const dataUrl = captureFrame();
-    if (!dataUrl) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
 
-    stopCamera();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d", { willReadFrequently: true })!.drawImage(video, 0, 0);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+
+    stopFrontCamera();
     setScanState("ocr-processing");
     setStatusMsg("Running OCR…");
 
@@ -118,75 +123,55 @@ export default function Scanner() {
       setScanState("error");
       setStatusMsg("OCR failed. Try again with better lighting.");
     }
-  }, [captureFrame, stopCamera]);
+  }, [stopFrontCamera]);
 
-  const reset = useCallback(() => {
-    stopCamera();
+  const reset = useCallback(async () => {
+    await stopQrScanner();
+    stopFrontCamera();
     setResult(null);
     setScanState("idle");
     setStatusMsg("");
-  }, [stopCamera]);
-
-  const showingCamera = scanState === "qr-scan" || scanState === "ask-front";
+  }, [stopQrScanner, stopFrontCamera]);
 
   return (
     <div className="w-full max-w-md flex flex-col gap-4">
 
-      {/* Camera — shown during both QR scan and ask-front stages */}
-      {showingCamera && (
-        <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: "4/3" }}>
-          <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-
-          {/* Overlay for QR targeting */}
-          {scanState === "qr-scan" && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="relative w-52 h-52">
-                <span className="absolute top-0 left-0 w-7 h-7 border-t-4 border-l-4 border-blue-400" />
-                <span className="absolute top-0 right-0 w-7 h-7 border-t-4 border-r-4 border-blue-400" />
-                <span className="absolute bottom-0 left-0 w-7 h-7 border-b-4 border-l-4 border-blue-400" />
-                <span className="absolute bottom-0 right-0 w-7 h-7 border-b-4 border-r-4 border-blue-400" />
-              </div>
-            </div>
-          )}
-
-          {/* Status bar */}
-          <div className="absolute top-0 left-0 right-0 text-center text-xs py-2 bg-black/50">
-            {scanState === "qr-scan" && <span className="text-blue-300">🔍 {statusMsg}</span>}
-            {scanState === "ask-front" && <span className="text-yellow-300">📷 {statusMsg}</span>}
-          </div>
-
-          {/* Bottom actions */}
-          <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center gap-2 pb-4 bg-gradient-to-t from-black/70 to-transparent pt-6">
-            {scanState === "qr-scan" && (
-              <>
-                <p className="text-xs text-gray-300">Point at the QR on the back of the card</p>
-                <button
-                  onClick={qrFailed}
-                  className="bg-white/20 hover:bg-white/30 text-white text-sm px-4 py-2 rounded-full border border-white/40 transition-colors"
-                >
-                  QR not working? Use front side
-                </button>
-              </>
-            )}
-            {scanState === "ask-front" && (
-              <>
-                <p className="text-xs text-yellow-200">Show the front of the Aadhaar card clearly</p>
-                <button
-                  onClick={runOCR}
-                  className="bg-yellow-500 hover:bg-yellow-400 text-black font-semibold text-sm px-6 py-2 rounded-full transition-colors"
-                >
-                  Capture & Extract Text
-                </button>
-              </>
-            )}
-          </div>
+      {/* Stage 1: QR scanner — html5-qrcode mounts into this div */}
+      {scanState === "qr-scan" && (
+        <div className="flex flex-col gap-3">
+          <div id={QR_ELEMENT_ID} className="rounded-xl overflow-hidden w-full" />
+          <p className="text-center text-xs text-gray-400">{statusMsg}</p>
+          <button
+            onClick={switchToFrontOCR}
+            className="w-full border border-gray-600 text-gray-300 py-2 rounded-lg text-sm hover:bg-gray-800 transition-colors"
+          >
+            QR not working? Use front side →
+          </button>
         </div>
       )}
 
-      {/* Hidden canvas */}
+      {/* Stage 2: Front-side capture */}
+      {scanState === "ask-front" && (
+        <div className="flex flex-col gap-3">
+          <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: "4/3" }}>
+            <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
+            <div className="absolute top-0 left-0 right-0 text-center text-xs py-2 bg-black/50 text-yellow-300">
+              {statusMsg}
+            </div>
+          </div>
+          <button
+            onClick={runOCR}
+            className="w-full bg-yellow-500 hover:bg-yellow-400 text-black font-semibold py-3 rounded-xl text-sm transition-colors"
+          >
+            Capture & Extract Text
+          </button>
+        </div>
+      )}
+
+      {/* Hidden canvas for OCR capture */}
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* OCR Processing */}
+      {/* OCR processing */}
       {scanState === "ocr-processing" && (
         <div className="bg-gray-800 rounded-xl p-8 text-center flex flex-col items-center gap-3">
           <div className="animate-spin w-8 h-8 border-2 border-yellow-400 border-t-transparent rounded-full" />
@@ -207,10 +192,10 @@ export default function Scanner() {
         </div>
       )}
 
-      {/* Idle start */}
+      {/* Idle */}
       {scanState === "idle" && (
         <button
-          onClick={startCamera}
+          onClick={startQRScan}
           className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-4 rounded-xl text-lg transition-colors"
         >
           Start Scanning
