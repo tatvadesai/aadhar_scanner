@@ -79,17 +79,44 @@ export function parseOCRText(text: string): AadhaarData {
   // Gender
   const genderMatch = text.match(/\b(Male|Female|MALE|FEMALE|M|F)\b/);
 
-  // Name: usually the line after "Name" or the first capitalized line
+  // Name: look for 2-4 consecutive capitalized English words on any line
+  // Aadhaar names are like "Desai Tatva Ripalkumar" — capitalized, no digits
   let name: string | undefined;
+
+  // First try: line explicitly labeled "Name" or "नाम"
   for (let i = 0; i < lines.length; i++) {
-    if (/^name/i.test(lines[i]) && lines[i + 1]) {
-      name = lines[i + 1];
+    if (/^(name|नाम)\s*[:\-]?\s*$/i.test(lines[i]) && lines[i + 1]) {
+      name = lines[i + 1].replace(/[^A-Za-z ]/g, " ").trim();
+      break;
+    }
+    // "Name: Foo Bar" on same line
+    const sameLine = lines[i].match(/(?:name|नाम)\s*[:\-]\s*([A-Za-z][A-Za-z ]{3,})/i);
+    if (sameLine) {
+      name = sameLine[1].trim();
       break;
     }
   }
+
   if (!name) {
-    // Fallback: first line that looks like a name (only letters and spaces, 2+ words)
-    name = lines.find((l) => /^[A-Za-z ]{5,40}$/.test(l) && l.split(" ").length >= 2);
+    // Fallback: scan every line, extract the longest run of capitalized English words
+    // e.g. from "El i ¥ Desai Tatva Ripalkumar (" we extract "Desai Tatva Ripalkumar"
+    let bestMatch = "";
+    for (const line of lines) {
+      // Skip lines that are clearly DOB/gender/aadhaar lines
+      if (/\d{2}[\/\-]\d{2}[\/\-]\d{4}/.test(line)) continue;
+      if (/\b(male|female|dob|yob)\b/i.test(line)) continue;
+      if (/\d{4}\s\d{4}/.test(line)) continue;
+
+      // Extract consecutive capitalized words (Title Case or ALL CAPS, min 2 chars each)
+      const matches = line.match(/\b([A-Z][a-z]{1,}|[A-Z]{2,})\b/g);
+      if (matches && matches.length >= 2) {
+        const candidate = matches.join(" ");
+        if (candidate.length > bestMatch.length) {
+          bestMatch = candidate;
+        }
+      }
+    }
+    if (bestMatch) name = bestMatch;
   }
 
   // Pincode: 6 digits
