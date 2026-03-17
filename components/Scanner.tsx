@@ -1,7 +1,6 @@
 "use client";
 
 import { useRef, useState, useCallback, useEffect } from "react";
-import jsQR from "jsqr";
 import { parseQRText, parseOCRText, AadhaarData } from "@/lib/parseAadhaar";
 import ResultCard from "@/components/ResultCard";
 
@@ -11,14 +10,15 @@ export default function Scanner() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const animFrameRef = useRef<number>(0);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const readerRef = useRef<any>(null);
 
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [statusMsg, setStatusMsg] = useState("");
   const [result, setResult] = useState<AadhaarData | null>(null);
 
   const stopCamera = useCallback(() => {
-    cancelAnimationFrame(animFrameRef.current);
+    try { readerRef.current?.reset(); } catch { /* ignore */ }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
@@ -26,105 +26,86 @@ export default function Scanner() {
   useEffect(() => () => stopCamera(), [stopCamera]);
 
   const runOCR = useCallback(async (imageDataUrl: string) => {
-    setStatusMsg("QR not found — running OCR (this may take a few seconds)…");
+    setStatusMsg("QR not detected — running OCR…");
     try {
       const Tesseract = (await import("tesseract.js")).default;
       const { data } = await Tesseract.recognize(imageDataUrl, "eng+hin", {
         logger: (m) => {
           if (m.status === "recognizing text") {
-            setStatusMsg(`OCR progress: ${Math.round((m.progress ?? 0) * 100)}%`);
+            setStatusMsg(`OCR: ${Math.round((m.progress ?? 0) * 100)}%`);
           }
         },
       });
-      const parsed = parseOCRText(data.text);
-      setResult(parsed);
+      setResult(parseOCRText(data.text));
       setScanState("done");
     } catch {
       setScanState("error");
-      setStatusMsg("OCR failed. Please try again with a clearer image.");
+      setStatusMsg("OCR failed. Try again with better lighting.");
     }
   }, []);
 
-  const captureAndProcess = useCallback(() => {
+  const captureAndOCR = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(video, 0, 0);
+    canvas.getContext("2d")!.drawImage(video, 0, 0);
 
     stopCamera();
     setScanState("processing");
-    setStatusMsg("Trying QR scan…");
-
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const qrResult = jsQR(imageData.data, imageData.width, imageData.height);
-
-    if (qrResult?.data) {
-      const parsed = parseQRText(qrResult.data);
-      if (parsed) {
-        setResult(parsed);
-        setScanState("done");
-        return;
-      }
-    }
-
-    // QR failed — run OCR
     runOCR(canvas.toDataURL("image/jpeg", 0.95));
   }, [stopCamera, runOCR]);
 
   const startCamera = useCallback(async () => {
     setScanState("scanning");
     setResult(null);
-    setStatusMsg("Point camera at the Aadhaar QR code");
+    setStatusMsg("Point at the QR code on the back of Aadhaar");
 
     try {
+      // Get camera stream — prefer back camera, high res for QR
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
       });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
-      }
 
-      // Auto QR scan loop
-      const tick = () => {
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
-          animFrameRef.current = requestAnimationFrame(tick);
-          return;
-        }
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext("2d")!;
-        ctx.drawImage(video, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const qr = jsQR(imageData.data, imageData.width, imageData.height);
+      const video = videoRef.current!;
+      video.srcObject = stream;
+      await video.play();
 
-        if (qr?.data) {
-          const parsed = parseQRText(qr.data);
+      // Use ZXing for continuous QR detection
+      const { BrowserQRCodeReader, IScannerControls } = await import("@zxing/browser");
+      void IScannerControls; // just for type import
+      const reader = new BrowserQRCodeReader();
+      readerRef.current = reader;
+
+      reader.decodeFromVideoElement(video, (result, err, controls) => {
+        if (result) {
+          const parsed = parseQRText(result.getText());
           if (parsed) {
+            controls.stop();
             stopCamera();
             setResult(parsed);
             setScanState("done");
-            return;
           }
         }
-
-        animFrameRef.current = requestAnimationFrame(tick);
-      };
-      animFrameRef.current = requestAnimationFrame(tick);
-    } catch {
+        // err is just "no QR found yet" — ignore it
+        void err;
+      });
+    } catch (e) {
+      console.error(e);
       setScanState("error");
       setStatusMsg("Camera access denied. Please allow camera permission.");
     }
   }, [stopCamera]);
 
   const reset = () => {
+    stopCamera();
     setResult(null);
     setScanState("idle");
     setStatusMsg("");
@@ -134,25 +115,34 @@ export default function Scanner() {
     <div className="w-full max-w-md flex flex-col gap-4">
       {/* Camera view */}
       {scanState === "scanning" && (
-        <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+        <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: "4/3" }}>
           <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-          <div className="absolute inset-0 flex items-center justify-center">
-            <div className="border-2 border-blue-400 rounded-lg w-2/3 h-2/3 opacity-70" />
+          {/* Targeting overlay */}
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="relative w-56 h-56">
+              {/* Corner markers */}
+              <span className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-blue-400 rounded-tl-sm" />
+              <span className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-blue-400 rounded-tr-sm" />
+              <span className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-blue-400 rounded-bl-sm" />
+              <span className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-blue-400 rounded-br-sm" />
+            </div>
           </div>
-          <div className="absolute bottom-2 left-0 right-0 text-center text-xs text-blue-300">{statusMsg}</div>
+          <div className="absolute top-3 left-0 right-0 text-center text-xs text-blue-300 bg-black/40 py-1">
+            {statusMsg}
+          </div>
           <button
-            onClick={captureAndProcess}
+            onClick={captureAndOCR}
             className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white text-black font-semibold px-5 py-2 rounded-full text-sm shadow-lg"
           >
-            Capture manually
+            No QR? Capture for OCR
           </button>
         </div>
       )}
 
-      {/* Hidden canvas for processing */}
+      {/* Hidden canvas */}
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* Processing state */}
+      {/* Processing */}
       {scanState === "processing" && (
         <div className="bg-gray-800 rounded-xl p-6 text-center">
           <div className="animate-spin w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full mx-auto mb-3" />
@@ -173,14 +163,19 @@ export default function Scanner() {
         </div>
       )}
 
-      {/* Start button */}
+      {/* Start */}
       {scanState === "idle" && (
-        <button
-          onClick={startCamera}
-          className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-4 rounded-xl text-lg transition-colors"
-        >
-          Start Scanning
-        </button>
+        <div className="flex flex-col gap-3">
+          <button
+            onClick={startCamera}
+            className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-4 rounded-xl text-lg transition-colors"
+          >
+            Scan QR Code (Back of Card)
+          </button>
+          <p className="text-center text-xs text-gray-500">
+            No QR? Use &quot;Capture for OCR&quot; after starting camera
+          </p>
+        </div>
       )}
     </div>
   );
