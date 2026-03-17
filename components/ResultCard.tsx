@@ -29,8 +29,8 @@ export default function ResultCard({ data, onReset }: Props) {
     <div className="bg-gray-900 border border-gray-700 rounded-xl p-5 flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <h2 className="font-semibold text-white">Extracted Data</h2>
-        <span className={`text-xs px-2 py-1 rounded-full ${data.source === "qr" ? "bg-green-900 text-green-300" : "bg-yellow-900 text-yellow-300"}`}>
-          via {data.source.toUpperCase()}
+        <span className="text-xs px-2 py-1 rounded-full bg-yellow-900 text-yellow-300">
+          via OCR
         </span>
       </div>
 
@@ -39,8 +39,7 @@ export default function ResultCard({ data, onReset }: Props) {
         {field("Aadhaar Number", "aadhaarNumber")}
         {field("Date of Birth", "dob")}
         {field("Gender", "gender")}
-        {field("Address", "address")}
-        {field("Pincode", "pincode")}
+{field("Pincode", "pincode")}
       </div>
 
       <div className="flex gap-2 pt-2">
@@ -61,7 +60,7 @@ export default function ResultCard({ data, onReset }: Props) {
         </button>
       </div>
 
-      {data.source === "ocr" && data.rawText && (
+      {data.rawText && (
         <details className="mt-1">
           <summary className="text-xs text-gray-500 cursor-pointer">Show raw OCR text</summary>
           <pre className="text-xs text-gray-500 mt-2 whitespace-pre-wrap break-words bg-gray-800 p-2 rounded">{data.rawText}</pre>
