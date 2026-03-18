@@ -1,15 +1,21 @@
 /**
- * SmolVLM-256M-Instruct inference via transformers.js
- * Runs entirely in-browser — no API, no server.
- * Model weights (~200MB) download from HuggingFace CDN on first use,
- * then cached in browser's Cache API.
+ * SmolVLM-256M-Instruct inference via @huggingface/transformers raw API.
+ * Uses AutoProcessor + AutoModelForVision2Seq directly — bypasses the
+ * pipeline registry which doesn't yet include image-text-to-text.
+ *
+ * Model weights (~200MB q4 quantized) download from HuggingFace CDN on
+ * first use, then cached in browser Cache API permanently.
  *
  * Last updated: 2026-03-18
  */
 
-import { pipeline, env } from "@huggingface/transformers";
+import {
+  AutoProcessor,
+  AutoModelForVision2Seq,
+  RawImage,
+  env,
+} from "@huggingface/transformers";
 
-// Always fetch from HuggingFace CDN — do not look for local model files
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
@@ -18,26 +24,39 @@ const MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct";
 type ProgressCallback = (msg: string) => void;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let pipe: any = null;
+let processor: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let model: any = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function makeProgressCb(onProgress?: ProgressCallback): (info: any) => void {
+  return (info) => {
+    if (!onProgress) return;
+    if (info.status === "downloading" && info.total) {
+      const pct = Math.round((info.loaded / info.total) * 100);
+      onProgress(`Downloading model: ${pct}%`);
+    } else if (info.status === "loading") {
+      onProgress("Loading model into memory…");
+    }
+  };
+}
 
 export async function loadVLM(onProgress?: ProgressCallback): Promise<void> {
-  if (pipe) return;
+  if (processor && model) return;
 
-  onProgress?.("Loading model — first time takes ~30s (downloads ~200MB, then cached)…");
+  onProgress?.(
+    "Loading SmolVLM — first time takes ~30s (downloads ~200MB, then cached)…"
+  );
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  pipe = await (pipeline as any)("image-text-to-text", MODEL_ID, {
-    dtype: "q4", // 4-bit quantized — smaller download, faster inference
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    progress_callback: (info: any) => {
-      if (info.status === "downloading" && info.total) {
-        const pct = Math.round((info.loaded / info.total) * 100);
-        onProgress?.(`Downloading model: ${pct}%`);
-      } else if (info.status === "loading") {
-        onProgress?.("Loading model into memory…");
-      }
-    },
-  });
+  [processor, model] = await Promise.all([
+    AutoProcessor.from_pretrained(MODEL_ID, {
+      progress_callback: makeProgressCb(onProgress),
+    }),
+    AutoModelForVision2Seq.from_pretrained(MODEL_ID, {
+      dtype: "q4",
+      progress_callback: makeProgressCb(onProgress),
+    }),
+  ]);
 }
 
 const AADHAAR_PROMPT = `You are extracting data from an Indian Aadhaar card image.
@@ -54,7 +73,7 @@ Return ONLY a valid JSON object — no explanation, no markdown, no extra text.
 Rules:
 - Hindi labels: नाम = name, जन्म तिथि = DOB, पुरुष = Male, महिला = Female
 - Aadhaar number is always 12 digits, may appear as XXXX XXXX XXXX
-- If a field is not visible or unreadable, use ""
+- If a field is not visible or unreadable use ""
 - Return ONLY the raw JSON object, nothing else`;
 
 export interface VLMResult {
@@ -71,33 +90,41 @@ export async function extractFromImage(
   onProgress?: ProgressCallback
 ): Promise<VLMResult> {
   await loadVLM(onProgress);
-
   onProgress?.("Analysing card…");
+
+  const image = await RawImage.fromURL(imageDataUrl);
 
   const messages = [
     {
       role: "user",
       content: [
-        { type: "image", url: imageDataUrl },
+        { type: "image" },
         { type: "text", text: AADHAAR_PROMPT },
       ],
     },
   ];
 
-  const output = await pipe(messages, { max_new_tokens: 256 });
+  const text = processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
 
-  // transformers.js v3: output[0].generated_text is array of turns
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const turns: any[] = output?.[0]?.generated_text ?? [];
-  const lastTurn = turns.at(-1);
-  const raw: string =
-    typeof lastTurn?.content === "string"
-      ? lastTurn.content
-      : JSON.stringify(lastTurn?.content ?? "");
+  const inputs = await processor(text, [image], { return_tensors: "pt" });
 
+  const generatedIds = await model.generate({
+    ...inputs,
+    max_new_tokens: 256,
+  });
+
+  // Slice off the prompt tokens — keep only the generated part
+  const newTokens = generatedIds.slice(null, [inputs.input_ids.dims[1], null]);
+  const decoded: string[] = processor.batch_decode(newTokens, {
+    skip_special_tokens: true,
+  });
+
+  const raw = decoded[0] ?? "";
   console.log("[VLM] raw output:", raw);
 
-  // Extract JSON from the response (model sometimes wraps it in markdown)
+  // Extract JSON — model sometimes wraps in markdown fences
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
     throw new Error("Model did not return valid JSON. Raw: " + raw);
@@ -114,6 +141,6 @@ export async function extractFromImage(
       raw,
     };
   } catch {
-    throw new Error("Failed to parse JSON from model output. Raw: " + raw);
+    throw new Error("Failed to parse model JSON. Raw: " + raw);
   }
 }
