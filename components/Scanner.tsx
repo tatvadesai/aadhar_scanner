@@ -2,8 +2,7 @@
 
 /**
  * Scanner component
- * Flow: camera preview → capture → SmolVLM-256M inference → editable result
- * Model runs entirely in-browser via transformers.js (no API, no server).
+ * Flow: camera preview → capture → /api/extract (Gemini 2.0 Flash) → editable result
  *
  * Last updated: 2026-03-18
  */
@@ -12,13 +11,7 @@ import { useRef, useState, useCallback, useEffect } from "react";
 import { AadhaarData } from "@/lib/parseAadhaar";
 import ResultCard from "@/components/ResultCard";
 
-type ScanState =
-  | "idle"
-  | "model-loading"
-  | "preview"
-  | "processing"
-  | "done"
-  | "error";
+type ScanState = "idle" | "preview" | "processing" | "done" | "error";
 
 export default function Scanner() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -29,7 +22,6 @@ export default function Scanner() {
   const [statusMsg, setStatusMsg] = useState("");
   const [result, setResult] = useState<AadhaarData | null>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
-  const [modelReady, setModelReady] = useState(false);
 
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -37,26 +29,6 @@ export default function Scanner() {
   }, []);
 
   useEffect(() => () => stopCamera(), [stopCamera]);
-
-  // Pre-warm the model on first render so it's ready when user scans
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const { loadVLM } = await import("@/lib/vlm");
-        await loadVLM((msg) => {
-          if (!cancelled) setStatusMsg(msg);
-        });
-        if (!cancelled) {
-          setModelReady(true);
-          setStatusMsg("");
-        }
-      } catch {
-        // Non-fatal — model will load on first scan instead
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
 
   const startCamera = useCallback(async () => {
     setScanState("preview");
@@ -89,32 +61,42 @@ export default function Scanner() {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d", { willReadFrequently: true })!.drawImage(video, 0, 0);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+
+    // Get base64 without the data URL prefix
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    const base64 = dataUrl.split(",")[1];
 
     stopCamera();
     setCapturedImage(dataUrl);
     setScanState("processing");
-    setStatusMsg("Starting…");
+    setStatusMsg("Extracting data…");
 
     try {
-      const { extractFromImage } = await import("@/lib/vlm");
-      const vlmResult = await extractFromImage(dataUrl, (msg) => setStatusMsg(msg));
+      const res = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64, mimeType: "image/jpeg" }),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        throw new Error(json.error ?? "Extraction failed");
+      }
 
       setResult({
-        name: vlmResult.name,
-        aadhaarNumber: vlmResult.aadhaar_number,
-        dob: vlmResult.dob,
-        gender: vlmResult.gender,
+        name: json.name,
+        aadhaarNumber: json.aadhaar_number,
+        dob: json.dob,
+        gender: json.gender,
         address: "",
-        rawOutput: vlmResult.raw,
+        rawOutput: json.raw,
       });
       setScanState("done");
     } catch (e) {
-      console.error("[VLM error]", e);
+      console.error("[extract error]", e);
       setScanState("error");
-      setStatusMsg(
-        e instanceof Error ? e.message : "Extraction failed. Try again."
-      );
+      setStatusMsg(e instanceof Error ? e.message : "Extraction failed. Try again.");
     }
   }, [stopCamera]);
 
@@ -129,29 +111,13 @@ export default function Scanner() {
   return (
     <div className="w-full max-w-md flex flex-col gap-4">
 
-      {/* Model loading banner (shown while pre-warming) */}
-      {!modelReady && statusMsg && scanState === "idle" && (
-        <div className="bg-gray-800 rounded-xl px-4 py-3 flex items-center gap-3">
-          <div className="animate-spin w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full shrink-0" />
-          <p className="text-xs text-gray-300">{statusMsg}</p>
-        </div>
-      )}
-
       {/* Camera preview */}
       {scanState === "preview" && (
         <div className="flex flex-col gap-3">
-          <div
-            className="relative rounded-xl overflow-hidden bg-black"
-            style={{ aspectRatio: "4/3" }}
-          >
-            <video
-              ref={videoRef}
-              className="w-full h-full object-cover"
-              playsInline
-              muted
-            />
+          <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: "4/3" }}>
+            <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
             <div className="absolute top-0 left-0 right-0 text-center text-xs py-2 bg-black/50 text-gray-300">
-              Hold the Aadhaar card steady, fully visible
+              Hold the Aadhaar card steady, fully in frame
             </div>
           </div>
           <button
@@ -170,18 +136,11 @@ export default function Scanner() {
       {scanState === "processing" && (
         <div className="flex flex-col gap-4">
           {capturedImage && (
-            <img
-              src={capturedImage}
-              alt="Captured card"
-              className="rounded-xl w-full object-cover opacity-60"
-            />
+            <img src={capturedImage} alt="Captured card" className="rounded-xl w-full object-cover opacity-70" />
           )}
           <div className="bg-gray-800 rounded-xl p-6 text-center flex flex-col items-center gap-3">
             <div className="animate-spin w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full" />
             <p className="text-sm text-gray-300">{statusMsg}</p>
-            <p className="text-xs text-gray-500">
-              Running SmolVLM-256M locally in your browser
-            </p>
           </div>
         </div>
       )}
@@ -195,9 +154,7 @@ export default function Scanner() {
       {scanState === "error" && (
         <div className="bg-red-900/40 border border-red-600 rounded-xl p-4 text-center">
           <p className="text-red-300 text-sm mb-3">{statusMsg}</p>
-          <button onClick={reset} className="text-sm underline text-red-300">
-            Try again
-          </button>
+          <button onClick={reset} className="text-sm underline text-red-300">Try again</button>
         </div>
       )}
 
@@ -211,7 +168,7 @@ export default function Scanner() {
             Scan Aadhaar Card
           </button>
           <p className="text-center text-xs text-gray-500">
-            Works on any Aadhaar variety · all processing on-device
+            Works on any Aadhaar variety · front or back
           </p>
         </div>
       )}
