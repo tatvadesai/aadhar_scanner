@@ -105,7 +105,7 @@ export default function Scanner() {
         aadhaarNumber: vlmResult.aadhaar_number,
         dob: vlmResult.dob,
         gender: vlmResult.gender,
-        address: vlmResult.address,
+        address: "",
         rawOutput: vlmResult.raw,
       });
       setScanState("done");

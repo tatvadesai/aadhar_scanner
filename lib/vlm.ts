@@ -19,7 +19,7 @@ import {
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct";
+const MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct";
 
 type ProgressCallback = (msg: string) => void;
 
@@ -59,29 +59,21 @@ export async function loadVLM(onProgress?: ProgressCallback): Promise<void> {
   ]);
 }
 
-const AADHAAR_PROMPT = `You are extracting data from an Indian Aadhaar card image.
-Return ONLY a valid JSON object — no explanation, no markdown, no extra text.
+const AADHAAR_PROMPT = `This is an Indian Aadhaar ID card. Extract the name, aadhaar number, date of birth, and gender from the card.
 
-{
-  "name": "full name in English",
-  "aadhaar_number": "12-digit number formatted as XXXX XXXX XXXX",
-  "dob": "date of birth as DD/MM/YYYY",
-  "gender": "Male or Female",
-  "address": "full address if visible, else empty string"
-}
+Return ONLY this JSON with real values from the card, nothing else:
+{"name":"","aadhaar_number":"","dob":"","gender":""}
 
-Rules:
-- Hindi labels: नाम = name, जन्म तिथि = DOB, पुरुष = Male, महिला = Female
-- Aadhaar number is always 12 digits, may appear as XXXX XXXX XXXX
-- If a field is not visible or unreadable use ""
-- Return ONLY the raw JSON object, nothing else`;
+Example of correct output:
+{"name":"Rahul Kumar","aadhaar_number":"1234 5678 9012","dob":"15/08/1990","gender":"Male"}
+
+Now extract from the card above. Return ONLY the JSON.`;
 
 export interface VLMResult {
   name: string;
   aadhaar_number: string;
   dob: string;
   gender: string;
-  address: string;
   raw: string;
 }
 
@@ -133,11 +125,10 @@ export async function extractFromImage(
   try {
     const parsed = JSON.parse(jsonMatch[0]);
     return {
-      name: parsed.name ?? "",
-      aadhaar_number: parsed.aadhaar_number ?? "",
-      dob: parsed.dob ?? "",
-      gender: parsed.gender ?? "",
-      address: parsed.address ?? "",
+      name: typeof parsed.name === "string" ? parsed.name : "",
+      aadhaar_number: typeof parsed.aadhaar_number === "string" ? parsed.aadhaar_number : "",
+      dob: typeof parsed.dob === "string" ? parsed.dob : "",
+      gender: typeof parsed.gender === "string" ? parsed.gender : "",
       raw,
     };
   } catch {
