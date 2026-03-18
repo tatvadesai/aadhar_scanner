@@ -1,32 +1,34 @@
 /**
  * POST /api/extract
- * Sends the captured Aadhaar card image to Gemini 2.0 Flash and returns
- * structured JSON with name, aadhaar_number, dob, gender.
+ * Sends captured Aadhaar card image to Groq (LLaMA 3.2 Vision 11B).
+ * Groq is free, fast, and works in India.
  *
  * Last updated: 2026-03-18
  */
 
 import { NextRequest, NextResponse } from "next/server";
 
-const GEMINI_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-const PROMPT = `This is an Indian Aadhaar card. Extract the following fields and return ONLY valid JSON, no explanation.
+const PROMPT = `This is an Indian Aadhaar card. Extract the name, aadhaar number, date of birth, and gender.
 
+Return ONLY this JSON with real values from the card:
 {"name":"","aadhaar_number":"","dob":"","gender":""}
 
+Example of correct output:
+{"name":"Rahul Kumar","aadhaar_number":"1234 5678 9012","dob":"15/08/1990","gender":"Male"}
+
 Rules:
-- name: full name in English
-- aadhaar_number: 12 digits formatted as XXXX XXXX XXXX
-- dob: DD/MM/YYYY
+- aadhaar_number: 12 digits as XXXX XXXX XXXX
+- dob: DD/MM/YYYY format
 - gender: Male or Female (पुरुष = Male, महिला = Female)
-- If a field is not visible use ""
-- Return ONLY the JSON object`;
+- Use "" for any field not visible
+- Return ONLY the JSON, nothing else`;
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "GEMINI_API_KEY not set" }, { status: 500 });
+    return NextResponse.json({ error: "GROQ_API_KEY not set" }, { status: 500 });
   }
 
   const { imageBase64, mimeType } = await req.json();
@@ -35,34 +37,42 @@ export async function POST(req: NextRequest) {
   }
 
   const body = {
-    contents: [
+    model: "llama-3.2-11b-vision-preview",
+    messages: [
       {
-        parts: [
-          { inline_data: { mime_type: mimeType ?? "image/jpeg", data: imageBase64 } },
-          { text: PROMPT },
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:${mimeType ?? "image/jpeg"};base64,${imageBase64}` },
+          },
+          { type: "text", text: PROMPT },
         ],
       },
     ],
-    generationConfig: { temperature: 0, maxOutputTokens: 256 },
+    temperature: 0,
+    max_tokens: 256,
   };
 
-  const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+  const res = await fetch(GROQ_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const err = await res.text();
-    console.error("[Gemini] error:", err);
-    return NextResponse.json({ error: "Gemini API error", detail: err }, { status: 502 });
+    console.error("[Groq] error:", err);
+    return NextResponse.json({ error: "Groq API error", detail: err }, { status: 502 });
   }
 
   const data = await res.json();
-  const raw: string = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  console.log("[Gemini] raw:", raw);
+  const raw: string = data.choices?.[0]?.message?.content ?? "";
+  console.log("[Groq] raw:", raw);
 
-  // Strip markdown fences if model wraps output
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
     return NextResponse.json({ error: "No JSON in response", raw }, { status: 500 });
